@@ -1,0 +1,45 @@
+model:
+  name: "weather-forecast"
+  algorithm: "GradientBoostingRegressor"
+  params:
+    n_estimators: 200       # filled in AFTER notebook experimentation
+    max_depth: 4            # filled in AFTER notebook experimentation
+    learning_rate: 0.05     # filled in AFTER notebook experimentation
+    random_state: 42
+
+data:
+  latitude: 52.52           # Berlin — change to your city
+  longitude: 13.41
+  timezone: "Europe/Berlin"
+  days_back: 365
+  raw_path: "data/raw/weather.csv"
+  processed_path: "data/processed/features.csv"
+
+features:
+  lags: [1, 2, 3]
+  rolling_window: 7
+  target_col: "target"
+  feature_cols:             # filled in AFTER notebook experimentation
+    - tmax_lag1
+    - tmax_lag2
+    - tmax_lag3
+    - tmin_lag1
+    - tmin_lag2
+    - tmin_lag3
+    - precip_lag1
+    - precip_lag2
+    - precip_lag3
+    - tmax_roll7_mean
+    - tmax_roll7_std
+    - windspeed_10m_max
+    - shortwave_radiation_sum
+    - day_of_year
+    - month
+
+evaluation:
+  mae_threshold: 3.0        # filled in AFTER notebook experimentation
+  improvement_pct: 0.05     # new model must beat prod by at least 5%
+
+mlflow:
+  experiment_name: "weather-forecast"
+  tracking_uri: "http://127.0.0.1:5000"
