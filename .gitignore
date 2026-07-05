@@ -1,0 +1,21 @@
+# Data — never commit raw or processed data
+data/
+
+# Python environment — machine-specific, not portable
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# MLflow tracking — lives locally or on a server, not in git
+mlruns/
+mlartifacts/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets — never ever commit these
+.env
+*.key
