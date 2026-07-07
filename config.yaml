@@ -11,7 +11,7 @@ data:
   latitude: -33.92           # Cape Town 
   longitude: 18.42
   timezone: "Africa/Johannesburg"
-  days_back: 365 * 10
+  days_back: 3650
   raw_path: "data/raw/weather.csv"
   processed_path: "data/processed/features.csv"
 
