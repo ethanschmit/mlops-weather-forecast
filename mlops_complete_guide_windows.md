@@ -204,30 +204,19 @@ data:
   latitude: -33.92          # Cape Town
   longitude: 18.42
   timezone: "Africa/Johannesburg"
-  days_back: 365
+  days_back: 3650           # ~10 years — pulled from the Historical Weather API
   raw_path: "data/raw/weather.csv"
   processed_path: "data/processed/features.csv"
 
 features:
-  lags: [1, 2, 3]
-  rolling_window: 7
   target_col: "target"
   feature_cols:             # filled in AFTER notebook experimentation
-    - tmax_lag1
-    - tmax_lag2
-    - tmax_lag3
-    - tmin_lag1
-    - tmin_lag2
-    - tmin_lag3
-    - precip_lag1
-    - precip_lag2
-    - precip_lag3
-    - tmax_roll7_mean
-    - tmax_roll7_std
+    - temperature_2m_max
+    - temperature_2m_min
     - wind_speed_10m_max
     - shortwave_radiation_sum
+    - precipitation_sum
     - day_of_year
-    - month
 
 evaluation:
   mae_threshold: 3.0        # filled in AFTER notebook experimentation
@@ -355,9 +344,9 @@ for lag in [1, 2, 3, 7]:
 
 # Rolling stats — smooth out noise, capture trends
 # .shift(1) BEFORE .rolling() — critical to not leak today's value into the window
-df_feat["tmax_roll7_mean"] = df_feat["temperature_2m_max"].shift(1).rolling(7).mean()
-df_feat["tmax_roll7_std"]  = df_feat["temperature_2m_max"].shift(1).rolling(7).std()
-df_feat["tmax_roll14_mean"] = df_feat["temperature_2m_max"].shift(1).rolling(14).mean()
+df_feat["tmax_roll2_mean"] = df_feat["temperature_2m_max"].shift(1).rolling(2).mean()
+df_feat["tmax_roll2_std"]  = df_feat["temperature_2m_max"].shift(1).rolling(2).std()
+df_feat["tmax_roll4_mean"] = df_feat["temperature_2m_max"].shift(1).rolling(4).mean()
 
 # Calendar features — capture seasonality
 df_feat["day_of_year"] = df_feat["time"].dt.dayofyear
@@ -365,8 +354,10 @@ df_feat["month"]       = df_feat["time"].dt.month
 df_feat["week"]        = df_feat["time"].dt.isocalendar().week.astype(int)
 
 # Pass-through features from the raw data
-# windspeed and radiation are already daily aggregates, use as-is
-# (they are already lag-safe since they are measured the same day, not tomorrow)
+# wind_speed_10m_max, shortwave_radiation_sum, precipitation_sum, and
+# temperature_2m_min/max are already daily aggregates — use as-is.
+# They are lag-safe as SAME-DAY predictors: today's conditions are fully
+# known at prediction time, so using them to predict TOMORROW's max is fine.
 
 # Target: NEXT day's max temperature
 # Shift by -1 so that for each row, target = what we want to predict
@@ -378,7 +369,9 @@ print(f"Rows after dropping NaN: {len(df_clean)} (lost {len(df_feat)-len(df_clea
 print(df_clean.head(3))
 ```
 
-**Why `.shift(1)` before `.rolling()`?** This is the data leakage point. If you compute a 7-day rolling mean including today's value, and today's value is correlated with tomorrow's target (which it is — temperature is autocorrelated), your model learns from the future. Always shift before rolling in time series.
+**Why `.shift(1)` before `.rolling()`?** This is the data leakage point. If you compute a rolling mean including today's value, and today's value is correlated with tomorrow's target (which it is — temperature is autocorrelated), your model learns from the future. Always shift before rolling in time series.
+
+> **Note on this project's actual result:** after running Cell 4's importance check below with 10 years of data, the raw same-day values (`temperature_2m_max`, `temperature_2m_min`, `wind_speed_10m_max`, `shortwave_radiation_sum`, `precipitation_sum`) plus `day_of_year` outperformed all the engineered lag/rolling features — none of the lag or rolling columns made the final cut. That's a legitimate outcome, not a mistake: with more data, the model found the raw values carried cleaner signal than smoothed/lagged versions. The lag/rolling code above is still worth knowing how to build — it's the kind of feature engineering that *does* often help on other datasets — but it didn't survive selection for this one.
 
 ---
 
@@ -392,8 +385,9 @@ candidate_features = [
     "tmax_lag1", "tmax_lag2", "tmax_lag3", "tmax_lag7",
     "tmin_lag1", "tmin_lag2", "tmin_lag3",
     "precip_lag1", "precip_lag2", "precip_lag3",
-    "tmax_roll7_mean", "tmax_roll7_std", "tmax_roll14_mean",
-    "wind_speed_10m_max", "shortwave_radiation_sum",
+    "tmax_roll2_mean", "tmax_roll2_std", "tmax_roll4_mean",
+    "temperature_2m_max", "temperature_2m_min",
+    "wind_speed_10m_max", "shortwave_radiation_sum", "precipitation_sum",
     "day_of_year", "month", "week",
 ]
 
@@ -422,13 +416,11 @@ print("\nLowest importance features (candidates to drop):")
 print(importances.sort_values().head(5))
 ```
 
-**What you are doing here:** You look at this chart and make a judgment call. Features with importance near 0.00 are noise — they add complexity without adding prediction power. Typically you'd drop anything below 0.01 or 0.02. In a weather example you'll probably find:
-- `tmax_lag1` dominates (yesterday's high is the best predictor of today's)
-- `tmax_roll7_mean` is strong (recent trend)
-- `week` may contribute almost nothing (captured by `day_of_year` already) → drop it
-- `tmax_lag7` may be weak once lag1-3 are included → drop it
+**What you are doing here:** You look at this chart and make a judgment call. Features with importance near 0.00 are noise — they add complexity without adding prediction power. Typically you'd drop anything below 0.01 or 0.02.
 
-**This is where your feature list for `config.yaml` comes from.** You make the decision here, once, in the notebook.
+**What actually happened on this project, with 10 years of Cape Town data:** the raw same-day values — `temperature_2m_max`, `temperature_2m_min`, `wind_speed_10m_max`, `shortwave_radiation_sum`, `precipitation_sum` — dominated the importance chart, along with `day_of_year` for seasonality. All the engineered lag features (`tmax_lag1`, etc.) and rolling stats (`tmax_roll2_mean`, etc.) scored near zero once the raw values were available — the model found today's actual conditions more informative than smoothed or lagged versions of them. `month` and `week` also contributed almost nothing once `day_of_year` was included (redundant seasonality signal) → dropped.
+
+**This is where your feature list for `config.yaml` comes from.** You make the decision here, once, in the notebook. Don't assume lags/rolling stats will always win just because they're common in time-series tutorials — always let the actual importance chart decide for your specific dataset.
 
 ---
 
@@ -441,14 +433,11 @@ from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 import numpy as np
 
 # The FINAL feature list — after dropping weak ones above
-# Edit this based on what you saw in cell 4
+# On this project, the raw same-day values won out over every
+# engineered lag/rolling feature (see Cell 4 note above)
 final_features = [
-    "tmax_lag1", "tmax_lag2", "tmax_lag3",
-    "tmin_lag1", "tmin_lag2", "tmin_lag3",
-    "precip_lag1", "precip_lag2", "precip_lag3",
-    "tmax_roll7_mean", "tmax_roll7_std",
-    "wind_speed_10m_max", "shortwave_radiation_sum",
-    "day_of_year", "month",
+    "temperature_2m_max", "wind_speed_10m_max", "shortwave_radiation_sum",
+    "temperature_2m_min", "day_of_year", "precipitation_sum",
 ]
 
 X = df_clean[final_features]
@@ -722,23 +711,16 @@ def load_config() -> dict:
 
 
 def build_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
-    feat_cfg = config["features"]
     df = df.copy().sort_values("time").reset_index(drop=True)
 
-    # Lag features — the notebook showed lags 1-3 were most useful
-    for lag in feat_cfg["lags"]:
-        df[f"tmax_lag{lag}"]   = df["temperature_2m_max"].shift(lag)
-        df[f"tmin_lag{lag}"]   = df["temperature_2m_min"].shift(lag)
-        df[f"precip_lag{lag}"] = df["precipitation_sum"].shift(lag)
+    # This project's final feature set is all same-day raw values plus
+    # day_of_year for seasonality — lag/rolling features were tried in the
+    # notebook (Cell 3/4) but did not survive feature selection, so there
+    # is no lag/rolling logic to replicate here. See config.yaml's
+    # features.feature_cols for the exact list this model expects.
 
-    # Rolling features — shift BEFORE rolling to prevent leakage
-    w = feat_cfg["rolling_window"]
-    df["tmax_roll7_mean"] = df["temperature_2m_max"].shift(1).rolling(w).mean()
-    df["tmax_roll7_std"]  = df["temperature_2m_max"].shift(1).rolling(w).std()
-
-    # Calendar features — capture seasonality
+    # Calendar feature — captures seasonality
     df["day_of_year"] = df["time"].dt.dayofyear
-    df["month"]       = df["time"].dt.month
 
     # Target: next day's max temperature
     df["target"] = df["temperature_2m_max"].shift(-1)
@@ -1000,21 +982,12 @@ print(f"Loaded model: {MODEL_NAME} (Production)")
 
 
 class WeatherInput(BaseModel):
-    tmax_lag1: float
-    tmax_lag2: float
-    tmax_lag3: float
-    tmin_lag1: float
-    tmin_lag2: float
-    tmin_lag3: float
-    precip_lag1: float
-    precip_lag2: float
-    precip_lag3: float
-    tmax_roll7_mean: float
-    tmax_roll7_std: float
+    temperature_2m_max: float
+    temperature_2m_min: float
     wind_speed_10m_max: float
     shortwave_radiation_sum: float
+    precipitation_sum: float
     day_of_year: int
-    month: int
 
 
 class PredictionResponse(BaseModel):
@@ -1058,14 +1031,11 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
   -d '{
-    "tmax_lag1": 18.5, "tmax_lag2": 17.2, "tmax_lag3": 16.8,
-    "tmin_lag1": 9.1,  "tmin_lag2": 8.4,  "tmin_lag3": 8.0,
-    "precip_lag1": 0.0, "precip_lag2": 2.1, "precip_lag3": 0.0,
-    "tmax_roll7_mean": 17.1, "tmax_roll7_std": 1.2,
+    "temperature_2m_max": 22.4, "temperature_2m_min": 12.1,
     "wind_speed_10m_max": 14.3, "shortwave_radiation_sum": 18.5,
-    "day_of_year": 180, "month": 6
+    "precipitation_sum": 0.0, "day_of_year": 180
   }'
-# {"predicted_tmax_tomorrow_celsius": 19.43, "model_name": "weather-forecast"}
+# {"predicted_tmax_tomorrow_celsius": 21.87, "model_name": "weather-forecast"}
 ```
 
 Stop uvicorn with `Ctrl+C`.
