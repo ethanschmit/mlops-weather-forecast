@@ -10,6 +10,7 @@ import pandas as pd
 import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import os
 
 # Load config
 with open("config.yaml") as f:
@@ -26,7 +27,11 @@ app = FastAPI(
 
 # Load model at startup — reads from MLflow registry
 # If you update the Production model, restart the container
-mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+MLFLOW_TRACKING_URI = os.getenv(
+    "MLFLOW_TRACKING_URI",
+    "http://127.0.0.1:5000"  # default for local non-Docker use
+)
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/Production")
 print(f"Loaded model: {MODEL_NAME} (Production)")
 
