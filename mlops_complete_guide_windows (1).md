@@ -43,6 +43,45 @@ Do this once. Never again.
 
 **Why Python 3.12, not the newest version?** MLflow (and a lot of production ML tooling) tends to lag a version or two behind Python's latest release. As of this guide, Python 3.14 breaks MLflow's server with an `ImportError: cannot import name 'Traversable' from importlib.abc` — a known compatibility bug, not something you did wrong. Installing 3.12 alongside any newer version you may already have is safe; use the `py` launcher (`py -3.12 ...`, `py -0` to list installed versions) to be explicit about which one a command uses.
 
+**Fix Windows' terminal encoding, once, so emoji output from libraries (MLflow prints a 🏃 on every run) doesn't crash your scripts:**
+```bash
+echo 'export PYTHONIOENCODING=utf-8' >> ~/.bashrc
+source ~/.bashrc
+```
+Without this, you'll eventually hit `UnicodeEncodeError: 'charmap' codec can't encode character...` — Windows' default terminal encoding (`cp1252`) can't display emoji, and some libraries print them. This is a one-time fix that applies to every future terminal session.
+
+---
+
+### Daily Startup Routine (do this every time you sit down to work)
+
+Since MLflow and Docker are **local processes tied to your laptop** — not cloud services — they stop the moment you close Docker Desktop, shut down, or close the terminal tab they're running in. GitHub Actions is the one exception (it runs on GitHub's own servers, independent of your laptop — see Part 8).
+
+**Every work session, in order:**
+
+1. **Start MLflow** (Terminal Tab 1 — leave running):
+```bash
+cd ~/Projects/mlops-weather-forecast
+source .venv/Scripts/activate
+mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*"
+```
+`--host 0.0.0.0` and `--allowed-hosts` (rather than the simpler `--host 127.0.0.1`) are required so that **both** your local Python scripts *and* a Docker container can reach this server without a 403 "Invalid Host header" rejection.
+
+2. **If you want the Docker container running too:**
+```bash
+docker start weather-api
+```
+(Only works if you've already built and run it once with `docker run -d -p 8000:8000 --name weather-api weather-forecast:latest` — see Part 5.) This will fail with a connection error if step 1 isn't already up, since the container loads its model from MLflow at startup.
+
+3. **Confirm everything is alive:**
+```bash
+curl http://127.0.0.1:5000        # MLflow UI
+curl http://localhost:8000/health # your API, if running
+```
+
+**When you're done for the day:** just close things down, nothing to clean up — `Ctrl+C` on the MLflow tab, `docker stop weather-api` if you started the container. Tomorrow, repeat from step 1.
+
+---
+
 ### Configure Git (one-time)
 
 Open a terminal (any terminal, not inside a project yet):
@@ -242,7 +281,7 @@ Start MLflow's tracking server in one terminal tab before opening the notebook �
 ```bash
 # Terminal Tab 1 — leave this running the whole time
 source .venv/Scripts/activate
-mlflow server --host 127.0.0.1 --port 5000
+mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*"
 ```
 
 Open a second tab, start Jupyter:
@@ -785,7 +824,7 @@ def train():
     target_col = config["features"]["target_col"]
     X, y = df[feat_cols], df[target_col]
 
-    # Connect to MLflow — must be running (mlflow server --host 127.0.0.1 --port 5000)
+    # Connect to MLflow — must be running (mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*")
     mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
     mlflow.set_experiment(config["mlflow"]["experiment_name"])
 
@@ -958,6 +997,7 @@ git push origin main
 import mlflow.sklearn
 import pandas as pd
 import yaml
+import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -974,9 +1014,15 @@ app = FastAPI(
     version="1.0",
 )
 
-# Load model at startup — reads from MLflow registry
-# If you update the Production model, restart the container
-mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+# Read tracking URI from environment variable first — this lets Docker
+# override it (to host.docker.internal:5000, via the Dockerfile's ENV line)
+# without touching this code. Falls back to config.yaml / localhost for
+# plain local (non-Docker) runs.
+MLFLOW_TRACKING_URI = os.getenv(
+    "MLFLOW_TRACKING_URI",
+    config.get("mlflow", {}).get("tracking_uri", "http://127.0.0.1:5000"),
+)
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/Production")
 print(f"Loaded model: {MODEL_NAME} (Production)")
 
@@ -1014,12 +1060,18 @@ def predict(data: WeatherInput):
         raise HTTPException(status_code=500, detail=str(e))
 ```
 
-Test it locally first, before Docker:
+Before running this, make sure `serving/` is an importable Python package — create an empty `__init__.py` inside it if you haven't already (same idea as `src/__init__.py` from Part 0's folder structure):
+```bash
+touch serving/__init__.py
+```
+
+Test it locally first, before Docker. **Run this from the project root, not from inside `serving/`** — `config.yaml` is loaded with a relative path, so the terminal's current folder needs to be the project root for `load_config()`/the config-loading line in `app.py` to find it:
 
 ```bash
-cd serving
-uvicorn app:app --reload --port 8000
+uvicorn serving.app:app --reload --port 8000
 ```
+
+Note the `serving.` prefix (dot, not slash) — this tells uvicorn "find `app` inside the `serving` package," while your terminal stays at the root so `config.yaml` resolves correctly. If you instead see `FileNotFoundError: config.yaml`, it means you're running from inside `serving/` — `cd` back to the project root and use the command above.
 
 In a new tab:
 
@@ -1042,6 +1094,25 @@ Stop uvicorn with `Ctrl+C`.
 
 ---
 
+### serving/requirements.txt
+
+This is a **separate, leaner file from the root `requirements.txt`** — it only lists what `app.py` actually imports at runtime (no Jupyter, matplotlib, pytest, etc., which the dev environment needs but the container doesn't). This also avoids dragging in Windows-only packages (`pywin32`, `pywinpty`) that `pip freeze` on Windows can silently include and that fail to build on Linux.
+
+```
+mlflow
+scikit-learn
+pandas
+pyyaml
+fastapi
+uvicorn
+```
+
+**Best practice for pinning versions:** build once with the unpinned list above, then capture the exact, Linux-verified versions from inside the container itself (not from your Windows `.venv`):
+```bash
+docker run --rm weather-forecast:latest pip freeze > serving/requirements.txt
+```
+This guarantees every version in the file actually installed and worked together on Linux — the same OS the container runs on — rather than reusing a Windows-side freeze that may not have matching Linux builds.
+
 ### serving/Dockerfile
 
 ```dockerfile
@@ -1049,14 +1120,14 @@ Stop uvicorn with `Ctrl+C`.
 # Packages the FastAPI app + its environment into a portable container.
 # The container connects to MLflow on startup to load the Production model.
 
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Set working directory inside the container
 WORKDIR /app
 
 # Copy and install dependencies FIRST — Docker caches this layer
 # so rebuilds are fast if you only change code, not requirements
-COPY requirements.txt .
+COPY serving/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
@@ -1078,6 +1149,8 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
+**Note the `FROM python:3.12-slim`** — this must match the Python version your `requirements.txt` was generated against. Since this project's `.venv` runs 3.12 (see Part 0's note on why 3.14 was avoided), the container needs 3.12 too, or pinned packages like `numpy` may not have a matching build for the container's Python version.
+
 Build and run the Docker image:
 
 ```bash
@@ -1086,9 +1159,20 @@ Build and run the Docker image:
 
 docker build -f serving/Dockerfile -t weather-forecast:latest .
 
-# Run it — connects to your local MLflow server
-docker run -p 8000:8000 weather-forecast:latest
+# Run it DETACHED (-d) so it keeps running in the background,
+# independent of this terminal tab staying open, and give it a
+# memorable --name so you can start/stop/check it later without
+# rebuilding: docker start weather-api / docker stop weather-api
+docker run -d -p 8000:8000 --name weather-api weather-forecast:latest
 ```
+
+**Prerequisite: your MLflow server must already be running** (see Part 3/setup) before starting the container — `app.py` needs to reach it at startup to load the "Production" model. Also, MLflow needs to be started with `--host 0.0.0.0` and an `--allowed-hosts` list that includes `host.docker.internal:*`, or the container's request will be rejected with a 403 "Invalid Host header" error. See the "Daily Startup Routine" note in Part 0 for the exact command.
+
+**Check the container is alive:**
+```bash
+docker logs weather-api
+```
+Look for `Loaded model: weather-forecast (Production)` and `Application startup complete`.
 
 While it's running, open a new tab:
 
@@ -1195,17 +1279,17 @@ jobs:
         uses: actions/checkout@v4
         # Pulls your repo onto the GitHub runner machine
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Start MLflow server
         run: |
-          mlflow server --host 127.0.0.1 --port 5000 &
+          mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*" &
           sleep 5    # give it time to start before the pipeline calls it
         # The & runs it in the background
 
@@ -1320,7 +1404,7 @@ This is why the structure matters — you are building reusable muscle memory, n
 | Task | Command |
 |---|---|
 | Activate environment | `source .venv/Scripts/activate` |
-| Start MLflow UI | `mlflow server --host 127.0.0.1 --port 5000` |
+| Start MLflow UI | `mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*"` |
 | Start Jupyter | `jupyter notebook` |
 | Run pipeline manually | `bash pipeline.sh` |
 | Build Docker image | `docker build -f serving/Dockerfile -t weather-forecast:latest .` |
