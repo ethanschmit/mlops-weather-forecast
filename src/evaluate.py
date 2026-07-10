@@ -1,8 +1,8 @@
 # src/evaluate.py
-# Compares new model against current production model in the registry.
-# Promotes if better, rejects if not.
+# Compares new model against the current "champion" in the registry.
+# Promotes by reassigning the champion alias if better, rejects if not.
 # Run: python src/evaluate.py --run_id <id> --mae <value>
-# Exit code: 0 = promoted, 1 = rejected (used by pipeline.sh)
+# Exit code: 0 = promoted, 1 = rejected (pipeline.sh treats both as valid outcomes)
 
 import sys
 import argparse
@@ -22,47 +22,34 @@ def promote_model(run_id: str, new_mae: float, config: dict) -> bool:
     threshold  = config["evaluation"]["mae_threshold"]
     min_improv = config["evaluation"]["improvement_pct"]
 
-    # Gate 1: absolute quality — reject garbage models regardless of comparison
+    # Gate 1: absolute quality
     if new_mae > threshold:
         print(f"REJECTED: CV MAE {new_mae:.3f} > threshold {threshold}")
         return False
 
-    # Gate 2: compare against current production model (if one exists)
+    # Gate 2: compare against whatever version currently holds "champion"
     try:
-        prod_versions = client.get_latest_versions(model_name, stages=["Production"])
-        if prod_versions:
-            prod_run = client.get_run(prod_versions[0].run_id)
-            prod_mae = float(prod_run.data.metrics["cv_mae"])
+        champion = client.get_model_version_by_alias(model_name, "champion")
+        champion_mae = float(client.get_run(champion.run_id).data.metrics["cv_mae"])
 
-            required_mae = prod_mae * (1 - min_improv)
-            if new_mae > required_mae:
-                print(f"REJECTED: {new_mae:.3f} not enough better than prod {prod_mae:.3f} "
-                      f"(needed < {required_mae:.3f})")
-                return False
+        required_mae = champion_mae * (1 - min_improv)
+        if new_mae > required_mae:
+            print(f"REJECTED: {new_mae:.3f} not enough better than champion {champion_mae:.3f} "
+                  f"(needed < {required_mae:.3f})")
+            return False
 
-            # Archive the old production model before promoting new one
-            client.transition_model_version_stage(
-                name=model_name,
-                version=prod_versions[0].version,
-                stage="Archived",
-            )
-            print(f"Archived previous prod model v{prod_versions[0].version} (MAE: {prod_mae:.3f})")
+        client.set_model_version_tag(model_name, champion.version, "status", "archived")
+        print(f"Archived previous champion v{champion.version} (MAE: {champion_mae:.3f})")
 
-    except Exception as e:
-        print(f"No existing prod model ({e}) — promoting directly")
+    except mlflow.exceptions.MlflowException as e:
+        print(f"No existing champion ({e}) — promoting directly")
 
-    # Promote the newest registered version
-    new_versions = client.get_latest_versions(model_name, stages=["None"])
-    if not new_versions:
-        print("ERROR: No model version found in 'None' stage to promote")
-        return False
+    # The version train.py just registered is always the highest version number
+    latest = max(client.search_model_versions(f"name='{model_name}'"), key=lambda v: int(v.version))
 
-    client.transition_model_version_stage(
-        name=model_name,
-        version=new_versions[-1].version,
-        stage="Production",
-    )
-    print(f"PROMOTED: v{new_versions[-1].version} → Production (MAE: {new_mae:.3f})")
+    client.set_registered_model_alias(model_name, "champion", latest.version)
+    client.set_model_version_tag(model_name, latest.version, "status", "champion")
+    print(f"PROMOTED: v{latest.version} → champion (MAE: {new_mae:.3f})")
     return True
 
 

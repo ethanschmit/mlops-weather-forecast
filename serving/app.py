@@ -32,8 +32,8 @@ MLFLOW_TRACKING_URI = os.getenv(
     "http://127.0.0.1:5000"  # default for local non-Docker use
 )
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/Production")
-print(f"Loaded model: {MODEL_NAME} (Production)")
+model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
+print(f"Loaded model: {MODEL_NAME} (champion)")
 
 
 class WeatherInput(BaseModel):

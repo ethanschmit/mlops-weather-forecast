@@ -19,3 +19,6 @@ Thumbs.db
 # Secrets — never ever commit these
 .env
 *.key
+
+# Reports
+reports/
