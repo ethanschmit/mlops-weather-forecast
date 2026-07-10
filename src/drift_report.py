@@ -11,9 +11,8 @@ import pandas as pd
 import yaml
 import mlflow
 import mlflow.sklearn
-from evidently import ColumnMapping
-from evidently.report import Report
-from evidently.metric_preset import DataDriftPreset, RegressionPreset
+from evidently import Report, Dataset, DataDefinition, Regression
+from evidently.presets import DataDriftPreset, RegressionPreset
 
 
 def load_config() -> dict:
@@ -32,7 +31,7 @@ if __name__ == "__main__":
     try:
         model = mlflow.sklearn.load_model(f"models:/{model_name}@champion")
     except Exception as e:
-        print(f"No Production model yet ({e}) — skipping drift report until first promotion.")
+        print(f"No champion model yet ({e}) — skipping drift report until first promotion.")
         exit(0)
 
     df = pd.read_csv(config["data"]["processed_path"], parse_dates=["time"])
@@ -42,20 +41,20 @@ if __name__ == "__main__":
     reference["prediction"] = model.predict(reference[feat_cols])
     current["prediction"]   = model.predict(current[feat_cols])
 
-    column_mapping = ColumnMapping(
-        target="target",
-        prediction="prediction",
-        datetime="time",
-        numerical_features=feat_cols,
+    data_definition = DataDefinition(
+        numerical_columns=feat_cols,
+        regression=[Regression(target="target", prediction="prediction")],
     )
+    reference_dataset = Dataset.from_pandas(reference, data_definition=data_definition)
+    current_dataset   = Dataset.from_pandas(current,   data_definition=data_definition)
 
-    report = Report(metrics=[DataDriftPreset(), RegressionPreset()])
-    report.run(reference_data=reference, current_data=current, column_mapping=column_mapping)
+    report = Report([DataDriftPreset(), RegressionPreset()])
+    # current dataset is the FIRST argument, reference is the SECOND — opposite
+    # of the old ColumnMapping-era API, easy to get backwards
+    my_eval = report.run(current_dataset, reference_dataset)
 
     Path("reports").mkdir(exist_ok=True)
-    report.save_html(f"reports/drift_report_{date.today().isoformat()}.html")
-    report.save_html("reports/latest_drift_report.html")
+    my_eval.save_html(f"reports/drift_report_{date.today().isoformat()}.html")
+    my_eval.save_html("reports/latest_drift_report.html")
 
-    drift_detected = report.as_dict()["metrics"][0]["result"]["dataset_drift"]
-    print(f"Drift report saved → reports/latest_drift_report.html")
-    print(f"Dataset drift detected: {drift_detected}")
+    print("Drift report saved → reports/latest_drift_report.html")
