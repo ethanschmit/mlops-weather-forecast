@@ -3,6 +3,8 @@
 
 > **This version is adapted for Windows + Cursor + Git Bash.** Every command below uses bash syntax and works as-is in Git Bash. If you ever switch to Cursor's PowerShell terminal instead, commands will need translating (e.g. `\` line-continuations become `` ` ``, `source .venv/Scripts/activate` becomes `.venv\Scripts\Activate.ps1`).
 
+> **v2 changelog (this revision):** migrated model promotion from MLflow's deprecated stages (`Production`/`Archived`) to the current **alias** system (`@champion`) — required as of MLflow 3.x, which removed the Stage column from the UI entirely. Added Part 11 (rollback), Part 12 (daily drift monitoring with Evidently), Part 13 (testing predictions), and Part 14 (reading drift reports). Fixed `pipeline.sh` so a rejected model no longer fails the GitHub Actions run.
+
 ---
 
 ## What You Are Building
@@ -11,9 +13,11 @@ A weather forecasting model that:
 - Pulls daily data from a free API (no account needed)
 - Is experimented on in a Jupyter notebook
 - Gets cleaned up into production scripts
-- Is tracked and versioned with MLflow
+- Is tracked and versioned with MLflow, promoted via a `champion` alias
 - Is served via a FastAPI endpoint inside Docker
 - Retrains automatically via GitHub Actions every day
+- Can be rolled back to any previous version, by code or in the browser
+- Produces a daily data + model drift report you can open in a browser
 
 This lives in **its own GitHub repo** — `mlops-weather-forecast`. When you build a second model (finance, fraud, etc.) it gets its own repo. Your GitHub profile becomes a clean list of standalone projects.
 
@@ -66,11 +70,13 @@ mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:
 ```
 `--host 0.0.0.0` and `--allowed-hosts` (rather than the simpler `--host 127.0.0.1`) are required so that **both** your local Python scripts *and* a Docker container can reach this server without a 403 "Invalid Host header" rejection.
 
+View it in your browser any time at **http://127.0.0.1:5000** — but only while this tab is running the server; it isn't a background service.
+
 2. **If you want the Docker container running too:**
 ```bash
 docker start weather-api
 ```
-(Only works if you've already built and run it once with `docker run -d -p 8000:8000 --name weather-api weather-forecast:latest` — see Part 5.) This will fail with a connection error if step 1 isn't already up, since the container loads its model from MLflow at startup.
+(Only works if you've already built and run it once with `docker run -d -p 8000:8000 --name weather-api weather-forecast:latest` — see Part 5.) This will fail with a connection error if step 1 isn't already up, since the container loads the `@champion` model from MLflow at startup.
 
 3. **Confirm everything is alive:**
 ```bash
@@ -138,6 +144,7 @@ mkdir -p notebooks \
          data/raw \
          data/processed \
          serving \
+         reports \
          .github/workflows
 
 touch notebooks/.gitkeep \
@@ -146,6 +153,8 @@ touch notebooks/.gitkeep \
       src/features.py \
       src/train.py \
       src/evaluate.py \
+      src/rollback.py \
+      src/drift_report.py \
       serving/app.py \
       serving/Dockerfile \
       pipeline.sh \
@@ -175,6 +184,9 @@ __pycache__/
 mlruns/
 mlartifacts/
 
+# Drift reports — generated daily, not committed
+reports/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -184,7 +196,7 @@ Thumbs.db
 *.key
 ```
 
-**Why does this matter?** If you commit your `data/` folder you'll push megabytes of CSV files to GitHub. If you commit `.env` files you'll expose API keys publicly. The `.gitignore` prevents both.
+**Why does this matter?** If you commit your `data/` folder you'll push megabytes of CSV files to GitHub. If you commit `.env` files you'll expose API keys publicly. The `.gitignore` prevents both. `reports/` is excluded for the same reason — it's regenerated every run, not source you maintain by hand (see Part 12 for how you actually view these).
 
 ### Step 1.5 — Set Up Python Environment
 
@@ -193,7 +205,7 @@ py -3.12 -m venv .venv
 source .venv/Scripts/activate
 
 pip install mlflow scikit-learn pandas requests \
-            fastapi uvicorn pytest pyyaml jupyter matplotlib seaborn
+            fastapi uvicorn pytest pyyaml jupyter matplotlib seaborn evidently
 
 pip freeze > requirements.txt
 ```
@@ -259,11 +271,14 @@ features:
 
 evaluation:
   mae_threshold: 3.0        # filled in AFTER notebook experimentation
-  improvement_pct: 0.05     # new model must beat prod by at least 5%
+  improvement_pct: 0.05     # new model must beat champion by at least 5%
 
 mlflow:
   experiment_name: "weather-forecast"
   tracking_uri: "http://127.0.0.1:5000"
+
+drift:
+  window_days: 30           # size of "current" window; everything older is "reference"
 ```
 
 Notice the comments — the params are placeholders. The notebook (Part 3) is where you discover the real values. Then you come back and fill them in here.
@@ -882,18 +897,20 @@ python src/train.py
 # RUN_ID=3a7f2b1c8d4e CV_MAE=1.823456
 ```
 
-Check `http://127.0.0.1:5000` → you'll see the run logged, and under "Models" you'll see `weather-forecast` registered.
+Check `http://127.0.0.1:5000` → you'll see the run logged, and under "Models" you'll see `weather-forecast` registered as a new version.
 
 ---
 
 ### src/evaluate.py
 
+> **This script uses MLflow's alias system, not the deprecated stage system.** Older MLflow guides (and older versions of this script) used `transition_model_version_stage(... stage="Production")`. As of MLflow 2.9 that's deprecated, and as of MLflow 3.x the registry UI no longer shows a Stage column at all — only aliases and tags. If you're on MLflow 3.x (check with `mlflow --version`), you must use this alias-based version.
+
 ```python
 # src/evaluate.py
-# Compares new model against current production model in the registry.
-# Promotes if better, rejects if not.
+# Compares new model against the current "champion" in the registry.
+# Promotes by reassigning the champion alias if better, rejects if not.
 # Run: python src/evaluate.py --run_id <id> --mae <value>
-# Exit code: 0 = promoted, 1 = rejected (used by pipeline.sh)
+# Exit code: 0 = promoted, 1 = rejected (pipeline.sh treats both as valid outcomes)
 
 import sys
 import argparse
@@ -918,42 +935,29 @@ def promote_model(run_id: str, new_mae: float, config: dict) -> bool:
         print(f"REJECTED: CV MAE {new_mae:.3f} > threshold {threshold}")
         return False
 
-    # Gate 2: compare against current production model (if one exists)
+    # Gate 2: compare against whatever version currently holds "champion"
     try:
-        prod_versions = client.get_latest_versions(model_name, stages=["Production"])
-        if prod_versions:
-            prod_run = client.get_run(prod_versions[0].run_id)
-            prod_mae = float(prod_run.data.metrics["cv_mae"])
+        champion = client.get_model_version_by_alias(model_name, "champion")
+        champion_mae = float(client.get_run(champion.run_id).data.metrics["cv_mae"])
 
-            required_mae = prod_mae * (1 - min_improv)
-            if new_mae > required_mae:
-                print(f"REJECTED: {new_mae:.3f} not enough better than prod {prod_mae:.3f} "
-                      f"(needed < {required_mae:.3f})")
-                return False
+        required_mae = champion_mae * (1 - min_improv)
+        if new_mae > required_mae:
+            print(f"REJECTED: {new_mae:.3f} not enough better than champion {champion_mae:.3f} "
+                  f"(needed < {required_mae:.3f})")
+            return False
 
-            # Archive the old production model before promoting new one
-            client.transition_model_version_stage(
-                name=model_name,
-                version=prod_versions[0].version,
-                stage="Archived",
-            )
-            print(f"Archived previous prod model v{prod_versions[0].version} (MAE: {prod_mae:.3f})")
+        client.set_model_version_tag(model_name, champion.version, "status", "archived")
+        print(f"Archived previous champion v{champion.version} (MAE: {champion_mae:.3f})")
 
-    except Exception as e:
-        print(f"No existing prod model ({e}) — promoting directly")
+    except mlflow.exceptions.MlflowException as e:
+        print(f"No existing champion ({e}) — promoting directly")
 
-    # Promote the newest registered version
-    new_versions = client.get_latest_versions(model_name, stages=["None"])
-    if not new_versions:
-        print("ERROR: No model version found in 'None' stage to promote")
-        return False
+    # The version train.py just registered is always the highest version number
+    latest = max(client.search_model_versions(f"name='{model_name}'"), key=lambda v: int(v.version))
 
-    client.transition_model_version_stage(
-        name=model_name,
-        version=new_versions[-1].version,
-        stage="Production",
-    )
-    print(f"PROMOTED: v{new_versions[-1].version} → Production (MAE: {new_mae:.3f})")
+    client.set_registered_model_alias(model_name, "champion", latest.version)
+    client.set_model_version_tag(model_name, latest.version, "status", "champion")
+    print(f"PROMOTED: v{latest.version} → champion (MAE: {new_mae:.3f})")
     return True
 
 
@@ -988,11 +992,11 @@ git push origin main
 
 ```python
 # serving/app.py
-# FastAPI app that loads the Production model from MLflow registry
+# FastAPI app that loads the champion model from MLflow registry
 # and serves predictions via HTTP.
-# The model loaded is ALWAYS whatever is currently tagged "Production"
-# in the registry — so when evaluate.py promotes a new model,
-# this app serves it on the next restart.
+# The model loaded is ALWAYS whatever version currently holds the
+# "champion" alias — so when evaluate.py (or rollback.py) reassigns
+# that alias, this app serves the new model on its next restart.
 
 import mlflow.sklearn
 import pandas as pd
@@ -1023,8 +1027,8 @@ MLFLOW_TRACKING_URI = os.getenv(
     config.get("mlflow", {}).get("tracking_uri", "http://127.0.0.1:5000"),
 )
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/Production")
-print(f"Loaded model: {MODEL_NAME} (Production)")
+model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
+print(f"Loaded model: {MODEL_NAME} (champion)")
 
 
 class WeatherInput(BaseModel):
@@ -1092,11 +1096,17 @@ curl -X POST http://localhost:8000/predict \
 
 Stop uvicorn with `Ctrl+C`.
 
----
+**Git checkpoint:**
+
+```bash
+git add serving/
+git commit -m "feat: FastAPI serving layer and Dockerfile"
+git push origin main
+```
 
 ### serving/requirements.txt
 
-This is a **separate, leaner file from the root `requirements.txt`** — it only lists what `app.py` actually imports at runtime (no Jupyter, matplotlib, pytest, etc., which the dev environment needs but the container doesn't). This also avoids dragging in Windows-only packages (`pywin32`, `pywinpty`) that `pip freeze` on Windows can silently include and that fail to build on Linux.
+This is a **separate, leaner file from the root `requirements.txt`** — it only lists what `app.py` actually imports at runtime (no Jupyter, matplotlib, pytest, evidently, etc., which the dev environment needs but the container doesn't). This also avoids dragging in Windows-only packages (`pywin32`, `pywinpty`) that `pip freeze` on Windows can silently include and that fail to build on Linux.
 
 ```
 mlflow
@@ -1118,7 +1128,7 @@ This guarantees every version in the file actually installed and worked together
 ```dockerfile
 # serving/Dockerfile
 # Packages the FastAPI app + its environment into a portable container.
-# The container connects to MLflow on startup to load the Production model.
+# The container connects to MLflow on startup to load the champion model.
 
 FROM python:3.12-slim
 
@@ -1166,13 +1176,13 @@ docker build -f serving/Dockerfile -t weather-forecast:latest .
 docker run -d -p 8000:8000 --name weather-api weather-forecast:latest
 ```
 
-**Prerequisite: your MLflow server must already be running** (see Part 3/setup) before starting the container — `app.py` needs to reach it at startup to load the "Production" model. Also, MLflow needs to be started with `--host 0.0.0.0` and an `--allowed-hosts` list that includes `host.docker.internal:*`, or the container's request will be rejected with a 403 "Invalid Host header" error. See the "Daily Startup Routine" note in Part 0 for the exact command.
+**Prerequisite: your MLflow server must already be running** (see Part 3/setup) before starting the container — `app.py` needs to reach it at startup to load the champion model. Also, MLflow needs to be started with `--host 0.0.0.0` and an `--allowed-hosts` list that includes `host.docker.internal:*`, or the container's request will be rejected with a 403 "Invalid Host header" error. See the "Daily Startup Routine" note in Part 0 for the exact command.
 
 **Check the container is alive:**
 ```bash
 docker logs weather-api
 ```
-Look for `Loaded model: weather-forecast (Production)` and `Application startup complete`.
+Look for `Loaded model: weather-forecast (champion)` and `Application startup complete`.
 
 While it's running, open a new tab:
 
@@ -1181,19 +1191,11 @@ docker ps                           # see running containers
 curl http://localhost:8000/health   # still works — now from inside Docker
 ```
 
-**What just happened:** Your model is now running in a fully isolated container. It has its own OS, its own Python, its own dependencies. It connects to your local MLflow server on startup to load the Production model. This container could now be deployed to any cloud provider unchanged.
+**What just happened:** Your model is now running in a fully isolated container. It has its own OS, its own Python, its own dependencies. It connects to your local MLflow server on startup to load the champion model. This container could now be deployed to any cloud provider unchanged.
 
 **Understanding the Docker build output:** Each line in the Dockerfile is a "layer". Docker caches layers. If you change only `app.py` and rebuild, Docker reuses the cached `pip install` layer — rebuild takes seconds not minutes. That's why dependencies are copied and installed before the application code.
 
 Stop the container with `Ctrl+C`.
-
-**Git checkpoint:**
-
-```bash
-git add serving/
-git commit -m "feat: FastAPI serving layer and Dockerfile"
-git push origin main
-```
 
 ---
 
@@ -1202,11 +1204,11 @@ git push origin main
 ```bash
 #!/bin/bash
 # pipeline.sh
-# Runs the full retraining pipeline: ingest → features → train → evaluate
+# Runs the full retraining pipeline: ingest → features → train → evaluate → drift
 # Called by GitHub Actions on a schedule, or manually with: bash pipeline.sh
 #
-# set -e means: if any command returns a non-zero exit code, stop immediately
-# Without this, a failed ingest would silently continue to train on stale data
+# set -e means: if any command returns a non-zero exit code, stop immediately.
+# Without this, a failed ingest would silently continue to train on stale data.
 set -e
 set -o pipefail    # catch errors inside pipes too
 
@@ -1215,15 +1217,15 @@ echo "PIPELINE START: $(date)"
 echo "======================================"
 
 echo ""
-echo "[1/4] Ingesting data..."
+echo "[1/5] Ingesting data..."
 python src/ingest.py
 
 echo ""
-echo "[2/4] Building features..."
+echo "[2/5] Building features..."
 python src/features.py
 
 echo ""
-echo "[3/4] Training model..."
+echo "[3/5] Training model..."
 # Capture the output line that contains RUN_ID and CV_MAE
 TRAIN_OUTPUT=$(python src/train.py)
 echo "$TRAIN_OUTPUT"
@@ -1234,8 +1236,19 @@ RUN_ID=$(echo "$TRAIN_OUTPUT" | grep -oP 'RUN_ID=\K\S+')
 MAE=$(echo "$TRAIN_OUTPUT"    | grep -oP 'CV_MAE=\K\S+')
 
 echo ""
-echo "[4/4] Evaluating and promoting (run=$RUN_ID, mae=$MAE)..."
-python src/evaluate.py --run_id "$RUN_ID" --mae "$MAE"
+echo "[4/5] Evaluating and promoting (run=$RUN_ID, mae=$MAE)..."
+# evaluate.py exits 1 when it rejects the new model — that's a valid,
+# expected outcome, not a pipeline failure. The if/else here stops that
+# exit code from tripping `set -e` and failing the whole run.
+if python src/evaluate.py --run_id "$RUN_ID" --mae "$MAE"; then
+    echo "Result: model promoted"
+else
+    echo "Result: new model rejected — champion unchanged"
+fi
+
+echo ""
+echo "[5/5] Generating drift report..."
+python src/drift_report.py
 
 echo ""
 echo "======================================"
@@ -1250,7 +1263,7 @@ chmod +x pipeline.sh
 bash pipeline.sh
 ```
 
-You should see all four steps execute and the model get promoted. Check `http://127.0.0.1:5000` — you'll see the new run.
+You should see all five steps execute. Check `http://127.0.0.1:5000` — you'll see the new run, and (on the first run) the new version holding the `champion` alias.
 
 ---
 
@@ -1303,9 +1316,19 @@ jobs:
           name: mlflow-runs-${{ github.run_number }}
           path: mlruns/
           retention-days: 30
+
+      - name: Save drift report as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drift-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
 ```
 
 **Important note:** In this local/free setup, the MLflow server is started fresh each run and the model artefacts are saved as GitHub Action artifacts. In production on Azure, MLflow would point to a persistent server and artefacts would be stored in Azure Blob Storage — but the `pipeline.sh` and all the Python scripts are identical.
+
+> **Known limitation of the free/local setup — read this once:** because each GitHub Actions run gets a brand-new, empty MLflow server on a fresh VM, nothing persists between days: no prior runs, no registered versions, no `champion` alias. This means the "must beat champion by 5%" comparison in `evaluate.py` never really triggers on the automated daily run — there's no champion to compare against, so it always falls into the "no existing champion, promoting directly" branch and only the absolute `mae_threshold` gate applies. It also means a rollback you do locally has **no effect** on the next automated run — that run starts from zero, in its own separate registry. This isn't a bug you introduced; it's inherent to running a stateless free tier this way. Fixing it properly means pointing GitHub Actions at a persistent, external MLflow backend (e.g. SQLite + a real artifact store, or a small hosted MLflow instance) instead of spinning up a fresh one each run — worth doing before this goes anywhere near a real production workload.
 
 Commit and push this:
 
@@ -1343,24 +1366,28 @@ Checks out your repo onto a fresh Linux VM
     → reads data/processed/features.csv
     → trains GBM with config.yaml params on ALL available data
     → logs run to MLflow (params, metrics, model artifact)
-    → registers new model version in MLflow registry (stage: None)
+    → registers new model version in MLflow registry
     → prints RUN_ID and CV_MAE
       │
       ▼
 [4] src/evaluate.py
-    → compares new CV_MAE against Production model's CV_MAE
+    → compares new CV_MAE against the current champion's CV_MAE
     → if better by ≥5% AND below absolute threshold:
-          archives old Production model
-          promotes new version to Production
-    → if not better: rejects, Production model unchanged
+          reassigns the "champion" alias to the new version
+    → if not better: rejects, champion unchanged (pipeline still succeeds)
+      │
+      ▼
+[5] src/drift_report.py
+    → compares the most recent window_days of data against the older history
+    → generates reports/latest_drift_report.html
       │
       ▼
 serving/app.py (already running in Docker)
-    → on next restart: loads whatever is now tagged "Production"
+    → on next restart: loads whatever version now holds "champion"
     → serves /predict with the updated model
 ```
 
-**Scoring (inference) is separate from this entire flow.** The Docker container sits running all day, serving predictions from whatever model is in Production. The pipeline above is purely about replacing that model when a better version is found.
+**Scoring (inference) is separate from this entire flow.** The Docker container sits running all day, serving predictions from whatever model holds `champion`. The pipeline above is purely about replacing that model when a better version is found.
 
 ---
 
@@ -1375,7 +1402,7 @@ serving/app.py (already running in Docker)
 | After changing config | `git add config.yaml` | `config: update mae_threshold to 2.8` |
 | Before pushing to production | `git push origin main` | (after commit) |
 
-**Never commit:** `data/`, `.venv/`, `mlruns/`, `.env` files — your `.gitignore` prevents this.
+**Never commit:** `data/`, `.venv/`, `mlruns/`, `reports/`, `.env` files — your `.gitignore` prevents this.
 
 **Branch workflow (once comfortable):** Create a branch for experiments: `git checkout -b experiment/try-xgboost`. Work, commit, push. Then merge via a Pull Request on GitHub. This keeps `main` clean and always deployable.
 
@@ -1399,21 +1426,322 @@ This is why the structure matters — you are building reusable muscle memory, n
 
 ---
 
+## Part 11: Rolling Back to a Previous Model Version
+
+Since `evaluate.py` uses MLflow's alias system, rollback is: reassign the `champion` alias to an older version. An alias can only point to one version at a time, so promoting an old version automatically un-promotes whatever held it before.
+
+### src/rollback.py
+
+```python
+# src/rollback.py
+# Lists all registered model versions with tags + who holds "champion", or
+# rolls back by reassigning the champion alias to a specific version.
+# Run: python src/rollback.py               (lists versions)
+#      python src/rollback.py --version 4   (makes v4 champion)
+
+import argparse
+import yaml
+import mlflow
+from mlflow.tracking import MlflowClient
+
+
+def load_config() -> dict:
+    with open("config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def list_versions(client: MlflowClient, model_name: str):
+    try:
+        champion_version = client.get_model_version_by_alias(model_name, "champion").version
+    except mlflow.exceptions.MlflowException:
+        champion_version = None
+
+    versions = sorted(client.search_model_versions(f"name='{model_name}'"), key=lambda v: int(v.version))
+    print(f"{'Version':<8}{'Alias':<12}{'CV_MAE':<10}Run ID")
+    for v in versions:
+        mae = client.get_run(v.run_id).data.metrics.get("cv_mae", float("nan"))
+        alias = "champion" if v.version == champion_version else ""
+        print(f"{v.version:<8}{alias:<12}{mae:<10.3f}{v.run_id}")
+
+
+def rollback(client: MlflowClient, model_name: str, target_version: str):
+    try:
+        current = client.get_model_version_by_alias(model_name, "champion")
+        client.set_model_version_tag(model_name, current.version, "status", "archived")
+        print(f"Archived current champion v{current.version}")
+    except mlflow.exceptions.MlflowException:
+        pass
+
+    client.set_registered_model_alias(model_name, "champion", target_version)
+    client.set_model_version_tag(model_name, target_version, "status", "champion")
+    print(f"PROMOTED: v{target_version} → champion")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--version", required=False, help="Version to roll back to. Omit to list versions.")
+    args = parser.parse_args()
+
+    config = load_config()
+    mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+    client = MlflowClient()
+    model_name = config["model"]["name"]
+
+    if args.version:
+        rollback(client, model_name, args.version)
+    else:
+        list_versions(client, model_name)
+```
+
+Usage:
+```bash
+python src/rollback.py
+# Version Alias       CV_MAE    Run ID
+# 1       archived    1.912     3a7f2b1c8d4e
+# 2       archived    1.845     9c1e0a2f7b3d
+# 3       champion    1.823     e4d2f8a01c9b
+
+python src/rollback.py --version 2
+# Archived current champion v3
+# PROMOTED: v2 → champion
+```
+
+Restart the Docker container afterward so it picks up the rolled-back model (it only loads `@champion` at startup): `docker restart weather-api`.
+
+**Important:** a manual rollback only holds until the pipeline runs again. If a later retraining run beats the version you rolled back to by the configured margin, it will be promoted over it automatically — rollback and automatic promotion use the exact same comparison logic, there's no "protect this version" flag. Also remember the persistence-gap note from Part 7: a local rollback has no effect on GitHub Actions, since that runs against its own separate, fresh MLflow registry each day.
+
+### Via the MLflow UI (browser)
+
+1. Open `http://127.0.0.1:5000` → **Models** tab → click `weather-forecast`.
+2. You'll see every version listed with its **Aliases** column (MLflow 3.x replaced the old Stage column with this).
+3. Find the row for the older version you want to promote → click **Add alias** on that version.
+4. Type `champion` and confirm. MLflow automatically moves the alias off whichever version held it before — you don't need to remove it manually first.
+5. Restart the container so it reloads the new champion: `docker restart weather-api`.
+
+**One gap to know about:** moving the alias in the UI does **not** update the `status` tag (`champion`/`archived`) that `rollback.py` and `evaluate.py` also set — aliases and tags are separate MLflow features, and the UI doesn't link them. If you roll back via the UI, the tag will say something stale until you either edit it manually on the version's page, or just use `python src/rollback.py --version N` instead, which updates both in one call.
+
+---
+
+## Part 12: Daily Data & Model Drift Report (Evidently)
+
+Since `ingest.py` re-pulls the full `days_back` history (~10 years) every run rather than incrementally, there's no need to persist a separate "reference" snapshot across days — that would break anyway on GitHub Actions since `data/` is gitignored and each run is a fresh VM. Instead, `drift_report.py` splits the *same* freshly-built `features.csv` by recency: everything except the last `window_days` is the reference (baseline), the last `window_days` is "current." This gives you both **data drift** (are recent conditions statistically different from the historical baseline) and **model drift** (is the champion model's error pattern changing on recent data vs. older data) — fully self-contained, no cross-run state needed.
+
+> **Evidently API note:** Evidently rewrote its API in versions 0.6/0.7 — the old `ColumnMapping` + `evidently.report`/`evidently.metric_preset` imports no longer exist. This guide uses the current `Dataset` + `DataDefinition` API (tested against evidently 0.7.21). If your installed version errors on these imports, check `pip show evidently` and search for the exact version's migration notes.
+
+### config.yaml (already included in Part 2)
+
+```yaml
+drift:
+  window_days: 30   # size of "current" window; everything older is "reference"
+```
+
+### requirements.txt
+
+Install into your `.venv` (not system-wide), then re-freeze so GitHub Actions installs it too:
+```bash
+source .venv/Scripts/activate
+pip install evidently
+pip freeze > requirements.txt
+```
+`evidently` only goes in the **root** `requirements.txt` — never `serving/requirements.txt`. The serving container never runs `drift_report.py`; adding it there just bloats the Docker image for no reason.
+
+### src/drift_report.py
+
+```python
+# src/drift_report.py
+# Compares the most recent window_days of data against all older data:
+# data drift (feature distributions) + model drift (prediction/target
+# relationship — is the champion model's error pattern changing over time).
+# Run: python src/drift_report.py
+# Output: reports/latest_drift_report.html (overwritten daily) + a dated copy
+
+from pathlib import Path
+from datetime import date
+import pandas as pd
+import yaml
+import mlflow
+import mlflow.sklearn
+from evidently import Report, Dataset, DataDefinition, Regression
+from evidently.presets import DataDriftPreset, RegressionPreset
+
+
+def load_config() -> dict:
+    with open("config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+if __name__ == "__main__":
+    config = load_config()
+    feat_cols   = config["features"]["feature_cols"]
+    window_days = config["drift"]["window_days"]
+
+    mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+    model_name = config["model"]["name"]
+
+    try:
+        model = mlflow.sklearn.load_model(f"models:/{model_name}@champion")
+    except Exception as e:
+        print(f"No champion model yet ({e}) — skipping drift report until first promotion.")
+        Path("reports").mkdir(exist_ok=True)
+        Path("reports/SKIPPED.txt").write_text(f"Drift report skipped: {e}\n")
+        exit(0)
+
+    df = pd.read_csv(config["data"]["processed_path"], parse_dates=["time"])
+    reference = df.iloc[:-window_days].reset_index(drop=True)
+    current   = df.iloc[-window_days:].reset_index(drop=True)
+
+    reference["prediction"] = model.predict(reference[feat_cols])
+    current["prediction"]   = model.predict(current[feat_cols])
+
+    data_definition = DataDefinition(
+        numerical_columns=feat_cols,
+        regression=[Regression(target="target", prediction="prediction")],
+    )
+    reference_dataset = Dataset.from_pandas(reference, data_definition=data_definition)
+    current_dataset   = Dataset.from_pandas(current,   data_definition=data_definition)
+
+    report = Report([DataDriftPreset(), RegressionPreset()])
+    # current dataset is the FIRST argument, reference is the SECOND — opposite
+    # of the old ColumnMapping-era API, easy to get backwards
+    my_eval = report.run(current_dataset, reference_dataset)
+
+    Path("reports").mkdir(exist_ok=True)
+    my_eval.save_html(f"reports/drift_report_{date.today().isoformat()}.html")
+    my_eval.save_html("reports/latest_drift_report.html")
+
+    print("Drift report saved → reports/latest_drift_report.html")
+```
+
+Test it (a champion model must already exist):
+```bash
+python src/drift_report.py
+# Drift report saved → reports/latest_drift_report.html
+```
+
+Open `reports/latest_drift_report.html` in a browser — see Part 14 for how to read what's in it.
+
+`pipeline.sh` already runs this as step `[5/5]` (Part 6), and the GitHub Actions workflow (Part 7) uploads whatever's in `reports/` as a downloadable artifact on every run — including a `SKIPPED.txt` note on days where no champion exists yet, so the artifact step never silently fails to find anything.
+
+**Git checkpoint:**
+```bash
+git add src/drift_report.py config.yaml requirements.txt .gitignore
+git commit -m "feat: daily Evidently drift reports"
+git push origin main
+```
+
+---
+
+## Part 13: Testing Predictions
+
+Two ways to send the API a request and see what it predicts, once the container is running (Part 5).
+
+### Option A — curl from the terminal
+
+Pull a few real, recent rows from your own processed data so the input values are realistic rather than made up:
+```bash
+tail -5 data/processed/features.csv
+```
+Pick one row's values (all columns except `target` and `time`) and plug them in:
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "temperature_2m_max": 22.4,
+    "temperature_2m_min": 12.1,
+    "wind_speed_10m_max": 14.3,
+    "shortwave_radiation_sum": 18.5,
+    "precipitation_sum": 0.0,
+    "day_of_year": 180
+  }'
+```
+Expected response:
+```json
+{"predicted_tmax_tomorrow_celsius": 21.87, "model_name": "weather-forecast"}
+```
+
+### Option B — the built-in Swagger UI (easiest for someone else to test, no terminal needed)
+
+While the container (or `uvicorn` locally) is running, open:
+```
+http://localhost:8000/docs
+```
+This is FastAPI's automatic interactive documentation — no extra setup, it's generated straight from `serving/app.py`'s type hints. Anyone you send this URL to (on the same machine or network) can:
+
+1. Click **POST /predict** to expand it
+2. Click **Try it out**
+3. Edit the example JSON body with their own values (or leave the defaults)
+4. Click **Execute**
+5. See the actual response, status code, and a ready-made `curl` command for it, right there in the browser
+
+This is the version worth sharing with someone who wants to "test the model" without installing anything or knowing what curl is.
+
+### Sanity-checking a prediction
+
+There's no ground truth for "tomorrow" available yet by definition, but you can sanity-check the model isn't broken:
+- `predicted_tmax_tomorrow_celsius` should be in a plausible Cape Town range for the season (roughly single digits to high 30s°C depending on time of year) — a wildly negative number or triple digits means something's off in feature ordering or units, not the weather.
+- Try nudging one input at a time (e.g. raise `temperature_2m_max` by 5) and confirm the prediction moves in a sensible direction — GBM models don't have to be perfectly monotonic, but a same-day max temp of 30°C shouldn't predict a colder tomorrow than an input of 15°C, most of the time.
+- Compare against `curl http://localhost:8000/health` first — if that doesn't return `{"status":"ok",...}`, the model never loaded and `/predict` will fail with a 500, not a bad prediction.
+
+---
+
+## Part 14: Reading and Interpreting the Drift Report
+
+Open `reports/latest_drift_report.html` in any browser (double-click it, or `start reports/latest_drift_report.html` in Git Bash on Windows). It has two main sections, one after the other on the page.
+
+### Section 1 — Data Drift
+
+This compares the **distribution** of each input feature in the `current` window (last `window_days`) against the `reference` window (everything older). At the top:
+- **A "Dataset Drift" summary** — detected / not detected, plus how many of your features individually flagged as drifted (e.g. "6 out of 6").
+- **A table, one row per feature**, showing its drift score and a visual comparison of the reference vs. current distributions (small histograms).
+
+**How to read the drift score:** Evidently picks a statistical test per feature automatically (commonly the Wasserstein distance, normalized, for numerical features like these). Higher = more different. There's a default threshold baked into "Detected"/"Not detected" — you don't need to compute anything yourself, just read the label.
+
+**The important caveat for this specific project:** because `reference` is your *entire* multi-year history and `current` is just the last 30 days, seasonal features (`day_of_year`, `temperature_2m_min/max`, `shortwave_radiation_sum`) will show up as "drifted" essentially every single day, purely because one month of the year always looks different from the average of all twelve months. That's expected seasonality being correctly detected, not a sign your data pipeline broke. Treat a "100% of columns drifted" result as a starting point to skim, not an alarm bell by itself — look at whether the *magnitude* of drift is unusually high compared to what you saw on previous days, not whether drift is flagged at all.
+
+### Section 2 — Regression Model Performance
+
+This is the model-drift half — it runs the champion model's actual predictions against both windows and compares quality:
+
+| What you'll see | What it means |
+|---|---|
+| **MAE** (Mean Absolute Error), Current vs Reference | Average °C the model is off by, on each window. Lower is better. Compare the two numbers directly. |
+| **MAPE** (Mean Absolute Percentage Error) | Same idea, as a percentage — easier to compare across seasons where absolute temperatures differ. |
+| **Max Absolute Error** | The single worst miss in each window — useful for catching rare bad predictions that MAE averages away. |
+| **R² Score** | How much of the temperature variation the model explains, per window. |
+| **Predicted vs Actual plot** | A line/scatter chart — the closer predicted tracks actual over time, the better. |
+| **Error Distribution / Error Normality** | Whether the model's mistakes are small and roughly random (healthy) or systematically biased in one direction (concerning). |
+
+**How to interpret it in practice:** if Current MAE/MAPE/Max Error are similar to or better than Reference, the model is performing fine on recent data — no action needed. If Current is meaningfully *worse* than Reference on MAE or MAPE specifically, that's the signal worth acting on (consider triggering a manual retrain, or lowering `mae_threshold` in `config.yaml` if it's consistently drifting worse over multiple days).
+
+**One number to treat with caution: R².** R² measures explained *variance*, not absolute accuracy — a short 30-day window naturally has less day-to-day temperature variation than a full multi-year history, so R² can drop noticeably even when MAE is flat or improved. Don't read a lower current-window R² alone as "the model got worse." Cross-check it against MAE/MAPE before drawing that conclusion.
+
+### Where to find it each day
+
+- **Running locally:** `reports/latest_drift_report.html` is overwritten by every `bash pipeline.sh` run; there's also a dated copy (`reports/drift_report_2026-07-10.html` etc.) if you want to compare a specific past day.
+- **From GitHub Actions:** repo → **Actions** tab → click the day's run → scroll to **Artifacts** → download `drift-report-<run number>` → unzip → open `latest_drift_report.html`. If that zip only contains `SKIPPED.txt`, it means no champion model existed yet that day (see Part 12) — not that anything failed.
+
+---
+
 ## Quick Reference Card
 
 | Task | Command |
 |---|---|
 | Activate environment | `source .venv/Scripts/activate` |
 | Start MLflow UI | `mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*"` |
+| View MLflow UI | `http://127.0.0.1:5000` |
 | Start Jupyter | `jupyter notebook` |
 | Run pipeline manually | `bash pipeline.sh` |
+| List model versions + champion | `python src/rollback.py` |
+| Roll back to a version | `python src/rollback.py --version N` |
+| Generate drift report manually | `python src/drift_report.py` |
+| View drift report | open `reports/latest_drift_report.html` in a browser |
 | Build Docker image | `docker build -f serving/Dockerfile -t weather-forecast:latest .` |
-| Run Docker container | `docker run -p 8000:8000 weather-forecast:latest` |
+| Run Docker container | `docker run -d -p 8000:8000 --name weather-api weather-forecast:latest` |
+| Restart container after promotion/rollback | `docker restart weather-api` |
 | See running containers | `docker ps` |
 | Stop a container | `docker stop <container_id>` |
 | Test API health | `curl http://localhost:8000/health` |
+| Test a prediction (browser, no terminal) | `http://localhost:8000/docs` |
 | Commit and push | `git add . && git commit -m "message" && git push origin main` |
 | See git history | `git log --oneline` |
 | See what's changed | `git status` |
-| View MLflow UI | `http://127.0.0.1:5000` |
-| View API docs | `http://localhost:8000/docs` |
