@@ -32,6 +32,8 @@ if __name__ == "__main__":
         model = mlflow.sklearn.load_model(f"models:/{model_name}@champion")
     except Exception as e:
         print(f"No champion model yet ({e}) — skipping drift report until first promotion.")
+        Path("reports").mkdir(exist_ok=True)
+        Path("reports/SKIPPED.txt").write_text(f"Drift report skipped: {e}\n")
         exit(0)
 
     df = pd.read_csv(config["data"]["processed_path"], parse_dates=["time"])
