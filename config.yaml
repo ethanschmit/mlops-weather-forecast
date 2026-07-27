@@ -33,5 +33,5 @@ mlflow:
   experiment_name: "weather-forecast"
   tracking_uri: "http://127.0.0.1:5000"
 
-drift:
-  window_days: 30   # size of "current" window; everything older is "reference"
+# drift:
+#   window_days: 30   # size of "current" window; everything older is "reference"

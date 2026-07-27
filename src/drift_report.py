@@ -1,9 +1,10 @@
 # src/drift_report.py
-# Compares the most recent window_days of data against all older data:
-# data drift (feature distributions) + model drift (prediction/target
-# relationship — is the model's error pattern changing over time).
+# Compares this calendar month's data against the SAME calendar month last
+# year — a fairer comparison than last-N-days-vs-everything, since it removes
+# seasonality as a false-positive drift source (May 2026 vs May 2025, not
+# May 2026 vs the entire 10-year history).
 # Run: python src/drift_report.py
-# Output: reports/latest_drift_report.html (overwritten daily) + dated copy
+# Output: reports/latest_drift_report.html (overwritten daily) + a dated copy
 
 from pathlib import Path
 from datetime import date
@@ -11,6 +12,7 @@ import pandas as pd
 import yaml
 import mlflow
 import mlflow.sklearn
+from mlflow.tracking import MlflowClient
 from evidently import Report, Dataset, DataDefinition, Regression
 from evidently.presets import DataDriftPreset, RegressionPreset
 
@@ -22,23 +24,41 @@ def load_config() -> dict:
 
 if __name__ == "__main__":
     config = load_config()
-    feat_cols   = config["features"]["feature_cols"]
-    window_days = config["drift"]["window_days"]
-
-    mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+    feat_cols  = config["features"]["feature_cols"]
     model_name = config["model"]["name"]
 
+    mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+    client = MlflowClient()
+
+    # Score with the most recently trained version, not the champion alias —
+    # a model can be registered by train.py and still get rejected by
+    # evaluate.py in the same run, and we still want a drift report that day.
     try:
-        model = mlflow.sklearn.load_model(f"models:/{model_name}@champion")
+        latest = max(client.search_model_versions(f"name='{model_name}'"), key=lambda v: int(v.version))
+        model = mlflow.sklearn.load_model(f"models:/{model_name}/{latest.version}")
     except Exception as e:
-        print(f"No champion model yet ({e}) — skipping drift report until first promotion.")
+        print(f"No model registered yet ({e}) — skipping drift report.")
         Path("reports").mkdir(exist_ok=True)
         Path("reports/SKIPPED.txt").write_text(f"Drift report skipped: {e}\n")
         exit(0)
 
     df = pd.read_csv(config["data"]["processed_path"], parse_dates=["time"])
-    reference = df.iloc[:-window_days].reset_index(drop=True)
-    current   = df.iloc[-window_days:].reset_index(drop=True)
+
+    today = date.today()
+    current   = df[(df["time"].dt.year == today.year)     & (df["time"].dt.month == today.month)]
+    reference = df[(df["time"].dt.year == today.year - 1) & (df["time"].dt.month == today.month)]
+
+    if len(current) < 5 or len(reference) < 5:
+        print(f"Not enough data for month-over-year comparison "
+              f"(current: {len(current)} rows, same month last year: {len(reference)} rows) — skipping.")
+        Path("reports").mkdir(exist_ok=True)
+        Path("reports/SKIPPED.txt").write_text(
+            f"Drift report skipped: current={len(current)} rows, reference={len(reference)} rows\n"
+        )
+        exit(0)
+
+    current   = current.reset_index(drop=True)
+    reference = reference.reset_index(drop=True)
 
     reference["prediction"] = model.predict(reference[feat_cols])
     current["prediction"]   = model.predict(current[feat_cols])
@@ -51,12 +71,10 @@ if __name__ == "__main__":
     current_dataset   = Dataset.from_pandas(current,   data_definition=data_definition)
 
     report = Report([DataDriftPreset(), RegressionPreset()])
-    # current dataset is the FIRST argument, reference is the SECOND — opposite
-    # of the old ColumnMapping-era API, easy to get backwards
     my_eval = report.run(current_dataset, reference_dataset)
 
     Path("reports").mkdir(exist_ok=True)
-    my_eval.save_html(f"reports/drift_report_{date.today().isoformat()}.html")
+    my_eval.save_html(f"reports/drift_report_{today.isoformat()}.html")
     my_eval.save_html("reports/latest_drift_report.html")
 
-    print("Drift report saved → reports/latest_drift_report.html")
+    print(f"Drift report saved — {today.strftime('%B %Y')} vs {today.replace(year=today.year-1).strftime('%B %Y')}")
