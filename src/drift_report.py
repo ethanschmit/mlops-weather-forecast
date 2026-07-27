@@ -36,7 +36,7 @@ if __name__ == "__main__":
     # that load fine by run_id or version number (see mlflow/mlflow#16429).
     try:
         champion_version = client.get_model_version_by_alias(model_name, "champion")
-        model = mlflow.sklearn.load_model(f"runs:/{champion_version.run_id}/model")
+        model = mlflow.sklearn.load_model(f"models:/{model_name}/{champion_version.version}")
     except Exception as e:
         print(f"No champion model yet ({e}) — skipping drift report.")
         Path("reports").mkdir(exist_ok=True)

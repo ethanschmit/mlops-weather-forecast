@@ -35,7 +35,7 @@ MLFLOW_TRACKING_URI = os.getenv(
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 client = MlflowClient()
 champion_version = client.get_model_version_by_alias(MODEL_NAME, "champion")
-model = mlflow.sklearn.load_model(f"runs:/{champion_version.run_id}/model")
+model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/{champion_version.version}")
 print(f"Loaded model: {MODEL_NAME} (champion, run {champion_version.run_id})")
 
 
