@@ -26,6 +26,6 @@ EXPOSE 8000
 # Healthcheck: Docker will ping /health every 30s
 # Container is marked unhealthy if this fails 3 times
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
