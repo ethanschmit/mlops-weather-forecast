@@ -30,14 +30,11 @@ if __name__ == "__main__":
     mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
     client = MlflowClient()
 
-    # Score with the most recently trained version, not the champion alias —
-    # a model can be registered by train.py and still get rejected by
-    # evaluate.py in the same run, and we still want a drift report that day.
+    # Score with the most champion model
     try:
-        latest = max(client.search_model_versions(f"name='{model_name}'"), key=lambda v: int(v.version))
-        model = mlflow.sklearn.load_model(f"models:/{model_name}/{latest.version}")
+        model = mlflow.sklearn.load_model(f"models:/{model_name}@champion")
     except Exception as e:
-        print(f"No model registered yet ({e}) — skipping drift report.")
+        print(f"No champion model yet ({e}) — skipping drift report.")
         Path("reports").mkdir(exist_ok=True)
         Path("reports/SKIPPED.txt").write_text(f"Drift report skipped: {e}\n")
         exit(0)
