@@ -6,6 +6,7 @@
 # this app serves it on the next restart.
 
 import mlflow.sklearn
+from mlflow.tracking import MlflowClient
 import pandas as pd
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -32,8 +33,10 @@ MLFLOW_TRACKING_URI = os.getenv(
     "http://127.0.0.1:5000"  # default for local non-Docker use
 )
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
-print(f"Loaded model: {MODEL_NAME} (champion)")
+client = MlflowClient()
+champion_version = client.get_model_version_by_alias(MODEL_NAME, "champion")
+model = mlflow.sklearn.load_model(f"runs:/{champion_version.run_id}/model")
+print(f"Loaded model: {MODEL_NAME} (champion, run {champion_version.run_id})")
 
 
 class WeatherInput(BaseModel):
