@@ -2,19 +2,45 @@ name: Daily Model Retraining
 
 on:
   schedule:
-    - cron: "0 6 * * *"
-  workflow_dispatch:
+    - cron: "0 6 * * *"    # 6am UTC every day
+  workflow_dispatch:         # manual trigger from GitHub UI
 
 permissions:
   contents: write   # required for the Pages deploy step below
 
 jobs:
   retrain:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest   # GitHub provides a fresh Linux VM for each run
 
     steps:
-      # ... all existing steps unchanged (checkout, setup python, install deps,
-      # start MLflow, run pipeline, save MLflow artifact) ...
+      - name: Checkout code
+        uses: actions/checkout@v4
+        # Pulls your repo onto the GitHub runner machine
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "127.0.0.1:*,localhost:*,host.docker.internal:*" &
+          sleep 5    # give it time to start before the pipeline calls it
+        # The & runs it in the background
+
+      - name: Run retraining pipeline
+        run: bash pipeline.sh
+
+      - name: Save MLflow runs as artifact
+        uses: actions/upload-artifact@v4
+        if: always()   # save even if pipeline failed — for debugging
+        with:
+          name: mlflow-runs-${{ github.run_number }}
+          path: mlruns/
+          retention-days: 30
 
       - name: Save drift report as artifact
         uses: actions/upload-artifact@v4
