@@ -1,19 +1,13 @@
-# serving/app.py
-# FastAPI app that loads the Production model from MLflow registry
-# and serves predictions via HTTP.
-# The model loaded is ALWAYS whatever is currently tagged "Production"
-# in the registry — so when evaluate.py promotes a new model,
-# this app serves it on the next restart.
-
-import mlflow.sklearn
-from mlflow.tracking import MlflowClient
+import os
+import joblib
+import mlflow
 import pandas as pd
 import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import os
+from mlflow.tracking import MlflowClient
+from mlflow.artifacts import download_artifacts
 
-# Load config
 with open("config.yaml") as f:
     config = yaml.safe_load(f)
 
@@ -26,18 +20,16 @@ app = FastAPI(
     version="1.0",
 )
 
-# Load model at startup — reads from MLflow registry
-# If you update the Production model, restart the container
 MLFLOW_TRACKING_URI = os.getenv(
     "MLFLOW_TRACKING_URI",
-    "http://127.0.0.1:5000"  # default for local non-Docker use
+    config.get("mlflow", {}).get("tracking_uri", "http://127.0.0.1:5000"),
 )
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 client = MlflowClient()
 champion_version = client.get_model_version_by_alias(MODEL_NAME, "champion")
-model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/{champion_version.version}")
+local_dir = download_artifacts(run_id=champion_version.run_id, artifact_path="pickled_model")
+model = joblib.load(os.path.join(local_dir, "model.joblib"))
 print(f"Loaded model: {MODEL_NAME} (champion, run {champion_version.run_id})")
-
 
 class WeatherInput(BaseModel):
     temperature_2m_max: float
